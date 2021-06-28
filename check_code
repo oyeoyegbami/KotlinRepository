@@ -1,0 +1,262 @@
+#!/usr/bin/env python
+
+######################################################################
+#
+# File: check_licenses
+#
+# Copyright 2017, Backblaze Inc. All Rights Reserved.
+#
+# License https://www.backblaze.com/using_b2_code.html
+#
+######################################################################
+
+from __future__ import print_function
+
+import sys
+import argparse
+import os
+import re
+from os.path import isdir, join
+
+USAGE = """Looks for some important copyright and licensing incantations at the top of files.
+Prints the file name and what's missing for each file that's missing incantations.
+
+Usages:
+
+    check_licenses directoryOrFile [...]
+
+"""
+
+IN_TESTLIB_RE = re.compile("/testlib/[^/]+$")
+IN_LIB_RE = re.compile("/lib/[^/]+$")
+
+
+########################
+#
+# for checking licenses
+#
+########################
+
+COPYRIGHT_RE = re.compile("Copyright 20[12][0-9], Backblaze Inc\. All Rights Reserved.")
+LICENSE_RE = re.compile("License https://www\.backblaze\.com/using_b2_code\.html")
+
+# how many lines at the top of a file should we look at?
+NUMBER_OF_LINES_TO_EXAMINE = 10
+
+########################
+#
+# for checking layering
+#
+########################
+
+LAYERS = [
+    'sample',
+    'client.webApiHttpClient',
+    'client',
+    'client.webApiClients',
+    'client.structures',
+    'client.contentHandlers',
+    'client.contentSources',
+    'client.credentialsSources',
+    'client.exceptions',
+    'json',
+    'util',
+    ]
+PACKAGE_PATTERN = re.compile(r'^package (.*);')
+IMPORT_PATTERN = re.compile(r'import *(static *)?([^ ]*);')
+PREFIX = 'com.backblaze.b2.'
+
+
+def handle_args(argv):
+    parser = argparse.ArgumentParser(description=USAGE)
+    parser.add_argument('directoriesOrFiles', nargs='*', help='The directories or files to check', default=["core/src/main"])
+    parsed_args = parser.parse_args()
+    return parsed_args
+
+
+# returns true iff we think this dirname is a component of the path.
+def is_in_dir(dir, path):
+    return (path.startswith(dir + "/") or (("/" + dir + "/") in path))
+
+# return true iff we should skip the file with the given path
+def shouldSkip(path):
+    if (("/.idea/" in path) or
+        # some intellij config files
+        path.startswith(".idea/") or
+        path.endswith(".iml") or
+
+        # git
+        is_in_dir(".git", path) or
+
+        # gradle
+        is_in_dir(".gradle", path) or
+        is_in_dir("gradle", path) or
+        path.endswith("/gradlew") or
+        path.endswith("/gradlew.bat") or
+        is_in_dir("build", path) or
+        
+
+        # external dependencies
+        IN_LIB_RE.search(path) or
+        IN_TESTLIB_RE.search(path) or
+
+        # the license *is* the license.  :)
+        path.endswith("/LICENSE") or
+
+        # special case these.  no license?
+        path.endswith("/README.md") or
+        path.endswith("/resources/b2-sdk-core/version.txt") or
+
+        # don't look at class files. they're generated binary!
+        path.endswith(".class")
+    ):
+        #print "SKIPPING " + path
+        return True
+    return False
+
+# works on one directorOrFile.  appends any issues to 'errors'
+def check(directoryOrFile, errors):
+    if shouldSkip(directoryOrFile):
+        return
+    
+    if isdir(directoryOrFile):
+        for entry in sorted(os.listdir(directoryOrFile)):
+            check(join(directoryOrFile, entry), errors)
+    else:
+        #print "checking " + directoryOrFile
+        check_file(directoryOrFile, errors)
+
+# examines the file with the specified path.
+# adds issues to 'errors'.
+# throws if there's a big problem, like not being able to read the file.
+def check_file(path, errors):
+    check_license(path, errors)
+    check_layering(path, errors)
+
+# looks for licensing problems in the specified file
+# adds issues to 'errors'.
+# throws if there's a big problem, like not being able to read the file.
+def check_license(path, errors):
+    has_copyright_line = False
+    has_license_line = False
+
+    with open(path, "r") as f:
+        line_num = 0
+        for line in f:
+            line_num += 1
+            if line_num > NUMBER_OF_LINES_TO_EXAMINE:
+                break
+            #print line
+            has_copyright_line = has_copyright_line or COPYRIGHT_RE.search(line)
+            has_license_line = has_license_line or LICENSE_RE.search(line)
+
+    missing = ""
+    if not has_copyright_line:
+        missing = "copyright"
+    if not has_license_line:
+        if missing:
+            missing += " and "
+        missing += "license"
+    if not has_copyright_line or not has_license_line:
+        errors.append("%s: missing %s" % (path, missing))
+
+
+def package_for_import(path):
+    """
+    Remove trailing class names:
+        java.util.ArrayList -> java.util
+        com.backblaze.www.api.rebuild.FixBatchServlet.Request -> com.backblaze.www.api.rebuild
+        com.backblaze.util.BzDateTimeUtil.MAX_DAY -> com.backblaze.util
+    """
+    words = path.split('.')
+    for i in range(len(words)):
+        if words[i][0].isupper() or words[i] == '*':
+            words = words[:i]
+            break
+    return '.'.join(words)
+
+
+def check_layering(path, errors):
+    try:
+        check_layering_might_throw(path, errors)
+    except Exception as e:
+        errors.append("%s: %s" % (path, str(e)))
+
+# returns true iff this is one of our packages
+def is_one_of_our_packages(full_package_name):
+    return full_package_name.startswith(PREFIX)
+
+
+# returns the index of the given package.
+# things in lower-numbered packages can look at things in higher-numbered packages.
+def get_package_index(full_package_name):
+    if not is_one_of_our_packages(full_package_name):
+        raise Exception("unexpected package '%s' (not within %s)" % (full_package_name, PREFIX))
+
+    package = full_package_name[len(PREFIX):]
+
+    if not package in LAYERS:
+        raise Exception("unexpected package '%s' (not within LAYERS)" % (package))
+    
+    package_index = LAYERS.index(package)
+    return package_index
+
+    
+def check_layering_might_throw(path, errors):
+    package = None
+    package_index = 999999
+
+    if not path.endswith(".java"):
+        return
+
+    with open(path, 'r') as f:
+        for line in f:
+
+            match = PACKAGE_PATTERN.match(line)
+            if match is not None:
+                assert package is None # there's an earlier package statement in this file?
+                package = match.group(1)
+                package_index = get_package_index(package)
+
+            match = IMPORT_PATTERN.match(line)
+            if match is not None:
+                assert package is not None  # no package statement yet?
+
+                imported_name = match.group(2)
+                imported = package_for_import(imported_name)
+                if is_one_of_our_packages(imported):
+                    imported_index = get_package_index(imported)
+
+                    if imported_index < package_index:
+                        errors.append("%s: imports %s which is higher in the layering" % (path, imported_name))
+
+            if line.startswith('class'):
+                # too far into the file for more imports, so skip the
+                # rest of the file.  this check could be better.  it
+                # could consider interfaces, enums, and modifiers on
+                # these things.  oh well.  we don't have tons of code.
+                break
+    
+
+
+
+def main():
+    args = handle_args(sys.argv)
+
+    for directoryOrFile in args.directoriesOrFiles:
+        errors = []
+        check(directoryOrFile, errors)
+
+    if errors:
+        print("check_code: there were %d errors" % (len(errors),))
+        for err in errors:
+            print("ERR: " + err)
+        sys.exit(1)
+    else:
+        print("check_code: looks good.")
+
+
+
+if __name__ == '__main__':
+    main()
+    sys.exit(0)
